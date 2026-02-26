@@ -15,7 +15,7 @@ if (!fs.existsSync(DOWNLOADS_DIR)) {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 }
 
-// ─── Locate yt-dlp ────────────────────────────────────────
+// ─── yt-dlp binary location ────────────────────────────────────────
 const YT_DLP = (() => {
   const candidates = ["/usr/local/bin/yt-dlp", "/usr/bin/yt-dlp", "yt-dlp"];
   for (const bin of candidates) {
@@ -24,90 +24,79 @@ const YT_DLP = (() => {
       return bin;
     } catch {}
   }
-  return "yt-dlp"; // assume in PATH
+  return "yt-dlp";
 })();
 
 console.log(`[yt-dlp] using: ${YT_DLP}`);
 console.log(`[ffmpeg] using: ${ffmpegPath}`);
 
-// ─── Cookie handling ──────────────────────────────────────
+// ─── Cookie from env ──────────────────────
 const COOKIE_FILE = path.join(__dirname, "cookies.txt");
 
+let cookieArg = "";
 if (process.env.YT_COOKIE) {
   fs.writeFileSync(COOKIE_FILE, process.env.YT_COOKIE.trim(), "utf-8");
-  console.log("✅ YT_COOKIE written to cookies.txt");
+  console.log("✅ Cookies written from YT_COOKIE env");
+  cookieArg = `--cookies "${COOKIE_FILE}"`;
 } else if (fs.existsSync(COOKIE_FILE) && fs.statSync(COOKIE_FILE).size > 100) {
   console.log("✅ Using existing cookies.txt");
+  cookieArg = `--cookies "${COOKIE_FILE}"`;
 } else {
-  console.log("⚠️ No valid cookies → age-restricted / music videos may fail");
+  console.log("⚠️ No cookies provided → restricted videos may fail");
 }
 
-const cookieArg = fs.existsSync(COOKIE_FILE) && fs.statSync(COOKIE_FILE).size > 100
-  ? `--cookies "${COOKIE_FILE}"`
-  : "";
+// Note: For PO Tokens, install bgutil-ytdlp-pot-provider via pip in Render build:
+// pip install -U bgutil-ytdlp-pot-provider
+// yt-dlp will auto-use it for web/mweb clients needing tokens.
 
-// 2026-safe clients (android_sdkless frequently broken → removed)
-const CLIENTS = ["android", "ios", "tv_embedded", "mweb", "web"];
-
-// ─── Health ───────────────────────────────────────────────
-app.get("/", (req, res) => {
-  res.send(`<h1>🎵 YT Downloader</h1><p>Running on port ${PORT}</p>`);
-});
-
-// ─── Build args ───────────────────────────────────────────
-function buildYtArgs(client = null, extra = "") {
+// ─── Build yt-dlp command base ──────────────────────────────────────
+function buildYtArgs(extra = "") {
   let args = `${YT_DLP} --no-warnings --ffmpeg-location "${ffmpegPath}"`;
 
-  if (client) {
-    args += ` --extractor-args "youtube:player_client=${client}"`;
-  }
+  // 2026-safe: default + mweb to trigger PO provider if needed
+  args += ` --extractor-args "youtube:player_client=default,mweb"`;
+
+  // Optional: Add player_skip if conflicts arise
+  // args += `;player_skip=webpage,configs`;
 
   args += ` --no-check-certificate ${cookieArg} ${extra}`;
   return args;
 }
 
-// ─── /info ────────────────────────────────────────────────
+// ─── Health check ───────────────────────────────────────────────────
+app.get("/", (req, res) => {
+  res.send(`<h1>🎵 YT Downloader (with PO Provider support)</h1><p>Running on port ${PORT}</p>`);
+});
+
+// ─── /info endpoint ─────────────────────────────────────────────────
 app.get("/info", async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: "Missing ?url=" });
 
-  for (const client of CLIENTS) {
-    try {
-      const cmd = buildYtArgs(client, `--skip-download --print-json "${url}"`);
-      const { stdout } = await execAsync(cmd, { timeout: 45000 });
-      const jsonLine = stdout.trim().split("\n").find(l => l.startsWith("{")) || stdout.trim();
-      const info = JSON.parse(jsonLine);
-
-      console.log(`[info] OK client=${client} — ${info.title || "?"}`);
-      return res.json({
-        title: info.title || "Unknown",
-        duration: info.duration || 0,
-        uploader: info.uploader || "Unknown",
-        thumbnail: info.thumbnail || null,
-      });
-    } catch (err) {
-      console.log(`[info] ${client} fail: ${err.message.split("\n")[0] || err}`);
-    }
-  }
-
-  // Fallback: no forced client
   try {
-    const cmd = buildYtArgs(null, `--skip-download --print-json "${url}"`);
-    const { stdout } = await execAsync(cmd, { timeout: 45000 });
+    const cmd = buildYtArgs(`--skip-download --print-json "${url}"`);
+    const { stdout } = await execAsync(cmd, { timeout: 60000 });
+
     const jsonLine = stdout.trim().split("\n").find(l => l.startsWith("{")) || stdout.trim();
     const info = JSON.parse(jsonLine);
+
+    console.log(`[info] Success — ${info.title || "?"}`);
 
     return res.json({
       title: info.title || "Unknown",
       duration: info.duration || 0,
       uploader: info.uploader || "Unknown",
+      thumbnail: info.thumbnail || null,
     });
-  } catch {}
-
-  res.status(500).json({ error: "Failed all clients. Possibly age-restricted, private, or region issue." });
+  } catch (err) {
+    console.error(`[info] Failed: ${err.message.split("\n")[0] || err}`);
+    res.status(500).json({
+      error: "Failed to fetch info. Check logs. Ensure PO provider is installed and cookies are fresh.",
+    });
+  }
 });
 
-// ─── /mp3 ─────────────────────────────────────────────────
+// ─── /mp3 endpoint ──────────────────────────────────────────────────
 app.get("/mp3", async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: "Missing ?url=" });
@@ -117,59 +106,30 @@ app.get("/mp3", async (req, res) => {
   const outPattern = `${tmpBase}.%(ext)s`;
   let finalFile = null;
 
-  // Try clients
-  for (const client of CLIENTS) {
-    try {
-      const cmd = buildYtArgs(
-        client,
-        `-f bestaudio/best -x --audio-format mp3 --audio-quality 192K -o "${outPattern}" "${url}"`
-      );
+  try {
+    const cmd = buildYtArgs(
+      `-f bestaudio/best -x --audio-format mp3 --audio-quality 192K -o "${outPattern}" "${url}"`
+    );
 
-      console.log(`[mp3] Trying ${client}...`);
-      await execAsync(cmd, { timeout: 240000 }); // 4 min for longer tracks
+    console.log(`[mp3] Starting download...`);
+    await execAsync(cmd, { timeout: 300000 }); // 5 min timeout
 
-      const files = fs.readdirSync(DOWNLOADS_DIR)
-        .filter(f => f.startsWith(`audio_${ts}`) && f.endsWith(".mp3"));
+    const files = fs.readdirSync(DOWNLOADS_DIR)
+      .filter(f => f.startsWith(`audio_${ts}`) && f.endsWith(".mp3"));
 
-      if (files.length > 0) {
-        finalFile = path.join(DOWNLOADS_DIR, files[0]);
-        console.log(`[mp3] Success ${client} → ${finalFile}`);
-        break;
-      }
-    } catch (err) {
-      console.log(`[mp3] ${client} fail: ${err.message.split("\n")[0] || err}`);
-      // cleanup partials
-      fs.readdirSync(DOWNLOADS_DIR)
-        .filter(f => f.startsWith(`audio_${ts}`))
-        .forEach(f => {
-          try { fs.unlinkSync(path.join(DOWNLOADS_DIR, f)); } catch {}
-        });
+    if (files.length > 0) {
+      finalFile = path.join(DOWNLOADS_DIR, files[0]);
+      console.log(`[mp3] Success → ${finalFile}`);
     }
-  }
-
-  // Final fallback (no client forced)
-  if (!finalFile) {
-    try {
-      const cmd = buildYtArgs(
-        null,
-        `-f bestaudio/best -x --audio-format mp3 --audio-quality 192K -o "${outPattern}" "${url}"`
-      );
-
-      await execAsync(cmd, { timeout: 240000 });
-      const files = fs.readdirSync(DOWNLOADS_DIR)
-        .filter(f => f.startsWith(`audio_${ts}`) && f.endsWith(".mp3"));
-
-      if (files.length > 0) finalFile = path.join(DOWNLOADS_DIR, files[0]);
-    } catch (err) {
-      console.log(`[mp3] default fail: ${err.message.split("\n")[0] || err}`);
-    }
+  } catch (err) {
+    console.error(`[mp3] Failed: ${err.message.split("\n")[0] || err}`);
   }
 
   if (!finalFile || !fs.existsSync(finalFile)) {
-    return res.status(500).json({ error: "All download attempts failed. Try cookies for restricted content." });
+    return res.status(500).json({ error: "Download failed. Install PO provider / refresh cookies." });
   }
 
-  // Stream it
+  // Stream & cleanup
   const stat = fs.statSync(finalFile);
   res.setHeader("Content-Type", "audio/mpeg");
   res.setHeader("Content-Length", stat.size);
@@ -185,5 +145,5 @@ app.get("/mp3", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🎵 YT MP3 service up on port ${PORT}`);
+  console.log(`🎵 YT MP3 service running on port ${PORT}`);
 });
