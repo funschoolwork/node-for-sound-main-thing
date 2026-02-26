@@ -1,4 +1,5 @@
 const express = require("express");
+const ffmpegPath = require("ffmpeg-static");
 const { exec } = require("child_process");
 const fs = require("fs");
 const path = require("path");
@@ -54,7 +55,7 @@ app.get("/info", async (req, res) => {
   try {
     const { stdout } = await execAsync(
       `${YT_DLP} --no-warnings --skip-download --print-json \
-       --extractor-args "youtube:player_client=android_vr" \
+       --ffmpeg-location "${ffmpegPath}" --extractor-args "youtube:player_client=android_vr" \
        ${cookieArg} "${url}"`,
       { timeout: 30000 }
     );
@@ -85,7 +86,7 @@ app.get("/mp3", async (req, res) => {
   try {
     await execAsync(
       `${YT_DLP} --no-warnings -f bestaudio/best \
-       --extractor-args "youtube:player_client=android_vr" \
+       --ffmpeg-location "${ffmpegPath}" --extractor-args "youtube:player_client=android_vr" \
        --no-check-certificate \
        -x --audio-format mp3 --audio-quality 192K \
        ${cookieArg} \
