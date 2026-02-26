@@ -7,6 +7,23 @@ const { promisify } = require("util");
 const execAsync = promisify(exec);
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// yt-dlp may be at different paths depending on environment
+const YT_DLP = (() => {
+  const candidates = [
+    "/usr/local/bin/yt-dlp",
+    "/usr/bin/yt-dlp",
+    process.env.YT_DLP_PATH || "yt-dlp",
+  ];
+  for (const p of candidates) {
+    try {
+      require("child_process").execSync(`${p} --version`, { stdio: "ignore" });
+      return p;
+    } catch {}
+  }
+  return "yt-dlp"; // fallback
+})();
+console.log(`[yt-dlp] using: ${YT_DLP}`);
 const DOWNLOADS_DIR = path.join(__dirname, "downloads");
 
 if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR);
@@ -36,7 +53,7 @@ app.get("/info", async (req, res) => {
 
   try {
     const { stdout } = await execAsync(
-      `yt-dlp --no-warnings --skip-download --print-json \
+      `${YT_DLP} --no-warnings --skip-download --print-json \
        --extractor-args "youtube:player_client=android_vr" \
        ${cookieArg} "${url}"`,
       { timeout: 30000 }
@@ -67,7 +84,7 @@ app.get("/mp3", async (req, res) => {
 
   try {
     await execAsync(
-      `yt-dlp --no-warnings -f bestaudio/best \
+      `${YT_DLP} --no-warnings -f bestaudio/best \
        --extractor-args "youtube:player_client=android_vr" \
        --no-check-certificate \
        -x --audio-format mp3 --audio-quality 192K \
