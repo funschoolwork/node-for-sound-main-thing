@@ -1,118 +1,109 @@
-const express = require("express");
+const express   = require("express");
 const ffmpegPath = require("ffmpeg-static");
-const { exec } = require("child_process");
-const fs = require("fs");
-const path = require("path");
+const { exec }  = require("child_process");
+const fs        = require("fs");
+const path      = require("path");
 const { promisify } = require("util");
 
 const execAsync = promisify(exec);
-const app = express();
-const PORT = process.env.PORT || 3000;
+const app       = express();
+const PORT      = process.env.PORT || 3000;
 
-// yt-dlp may be at different paths depending on environment
+// ─── Find yt-dlp binary ──────────────────────────
 const YT_DLP = (() => {
-  const candidates = [
-    "/usr/local/bin/yt-dlp",
-    "/usr/bin/yt-dlp",
-    process.env.YT_DLP_PATH || "yt-dlp",
-  ];
-  for (const p of candidates) {
-    try {
-      require("child_process").execSync(`${p} --version`, { stdio: "ignore" });
-      return p;
-    } catch {}
+  for (const p of ["/usr/local/bin/yt-dlp", "/usr/bin/yt-dlp", "yt-dlp"]) {
+    try { require("child_process").execSync(`${p} --version`, { stdio: "ignore" }); return p; } catch {}
   }
-  return "yt-dlp"; // fallback
+  return "yt-dlp";
 })();
 console.log(`[yt-dlp] using: ${YT_DLP}`);
-const DOWNLOADS_DIR = path.join(__dirname, "downloads");
+console.log(`[ffmpeg] using: ${ffmpegPath}`);
 
+const DOWNLOADS_DIR = path.join(__dirname, "downloads");
 if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR);
 
-// Write cookie file from env if present
-const COOKIE_FILE = path.join(__dirname, "cookies.txt");
-if (process.env.YT_COOKIE) {
-  fs.writeFileSync(COOKIE_FILE, process.env.YT_COOKIE, "utf-8");
-  console.log("✅ Cookie file created.");
-} else {
-  console.log("⚠️  No YT_COOKIE found.");
-}
+// ─── Clients to try in order (no cookies — avoids forced web client) ─
+// We intentionally do NOT pass cookies so yt-dlp doesn't switch to web client
+const CLIENTS = ["android_sdkless", "android", "ios", "tv_embedded"];
 
 // ─── Health check ────────────────────────────────
 app.get("/", (req, res) => {
-  res.send("<h1>🎵 YT Service</h1><p>Running.</p>");
+  res.send(`<h1>🎵 YT Service</h1><p>Running. yt-dlp: ${YT_DLP}</p>`);
 });
 
-// ─── /info  — returns title, duration, uploader ──
+// ─── /info ───────────────────────────────────────
 app.get("/info", async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: "Missing url param" });
 
-  const cookieArg = fs.existsSync(COOKIE_FILE) && fs.statSync(COOKIE_FILE).size > 0
-    ? `--cookies "${COOKIE_FILE}"`
-    : "";
-
-  try {
-    const { stdout } = await execAsync(
-      `${YT_DLP} --no-warnings --skip-download --print-json \
-       --ffmpeg-location "${ffmpegPath}" --extractor-args "youtube:player_client=android_sdkless" \
-       ${cookieArg} "${url}"`,
-      { timeout: 30000 }
-    );
-    const info = JSON.parse(stdout.trim().split("\n")[0]);
-    res.json({
-      title:    info.title    || "Unknown",
-      duration: info.duration || 0,
-      uploader: info.uploader || "Unknown",
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  for (const client of CLIENTS) {
+    try {
+      const { stdout } = await execAsync(
+        `${YT_DLP} --no-warnings --skip-download --print-json` +
+        ` --ffmpeg-location "${ffmpegPath}"` +
+        ` --extractor-args "youtube:player_client=${client}"` +
+        ` "${url}"`,
+        { timeout: 30000 }
+      );
+      const info = JSON.parse(stdout.trim().split("\n")[0]);
+      console.log(`[info] success with client: ${client}`);
+      return res.json({
+        title:    info.title    || "Unknown",
+        duration: info.duration || 0,
+        uploader: info.uploader || "Unknown",
+      });
+    } catch (e) {
+      console.log(`[info] client ${client} failed: ${e.message.split("\n")[0]}`);
+    }
   }
+
+  res.status(500).json({ error: "All clients failed to fetch video info" });
 });
 
-// ─── /mp3  — downloads and streams MP3 back ──────
+// ─── /mp3 ────────────────────────────────────────
 app.get("/mp3", async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: "Missing url param" });
 
-  const cookieArg = fs.existsSync(COOKIE_FILE) && fs.statSync(COOKIE_FILE).size > 0
-    ? `--cookies "${COOKIE_FILE}"`
-    : "";
-
-  // Temp filename using timestamp to avoid collisions
   const tmpBase = path.join(DOWNLOADS_DIR, `audio_${Date.now()}`);
   const outMp3  = `${tmpBase}.mp3`;
 
-  try {
-    await execAsync(
-      `${YT_DLP} --no-warnings -f bestaudio/best \
-       --ffmpeg-location "${ffmpegPath}" --extractor-args "youtube:player_client=android_sdkless" \
-       --no-check-certificate \
-       -x --audio-format mp3 --audio-quality 192K \
-       ${cookieArg} \
-       -o "${tmpBase}.%(ext)s" "${url}"`,
-      { timeout: 120000 }
-    );
-
-    if (!fs.existsSync(outMp3)) {
-      // yt-dlp sometimes names it differently — find it
-      const files = fs.readdirSync(DOWNLOADS_DIR)
-        .filter(f => f.startsWith(path.basename(tmpBase)) && f.endsWith(".mp3"));
-      if (!files.length) return res.status(500).json({ error: "MP3 not found after conversion" });
-      const found = path.join(DOWNLOADS_DIR, files[0]);
-      return streamAndClean(res, found);
-    }
-
-    streamAndClean(res, outMp3);
-  } catch (e) {
-    // Clean up any partial files
+  for (const client of CLIENTS) {
     try {
-      fs.readdirSync(DOWNLOADS_DIR)
-        .filter(f => f.startsWith(path.basename(tmpBase)))
-        .forEach(f => fs.unlinkSync(path.join(DOWNLOADS_DIR, f)));
-    } catch {}
-    res.status(500).json({ error: e.message });
+      await execAsync(
+        `${YT_DLP} --no-warnings -f bestaudio/best` +
+        ` --ffmpeg-location "${ffmpegPath}"` +
+        ` --extractor-args "youtube:player_client=${client}"` +
+        ` --no-check-certificate` +
+        ` -x --audio-format mp3 --audio-quality 192K` +
+        ` -o "${tmpBase}.%(ext)s" "${url}"`,
+        { timeout: 120000 }
+      );
+
+      // Find the output file
+      let finalPath = outMp3;
+      if (!fs.existsSync(finalPath)) {
+        const files = fs.readdirSync(DOWNLOADS_DIR)
+          .filter(f => f.startsWith(path.basename(tmpBase)) && f.endsWith(".mp3"));
+        if (!files.length) throw new Error("MP3 not found after conversion");
+        finalPath = path.join(DOWNLOADS_DIR, files[0]);
+      }
+
+      console.log(`[mp3] success with client: ${client}`);
+      return streamAndClean(res, finalPath);
+
+    } catch (e) {
+      console.log(`[mp3] client ${client} failed: ${e.message.split("\n")[0]}`);
+      // Clean up partial files before trying next client
+      try {
+        fs.readdirSync(DOWNLOADS_DIR)
+          .filter(f => f.startsWith(path.basename(tmpBase)))
+          .forEach(f => fs.unlinkSync(path.join(DOWNLOADS_DIR, f)));
+      } catch {}
+    }
   }
+
+  res.status(500).json({ error: "All clients failed to convert video" });
 });
 
 function streamAndClean(res, filePath) {
@@ -122,11 +113,7 @@ function streamAndClean(res, filePath) {
   res.setHeader("Content-Disposition", `attachment; filename="${path.basename(filePath)}"`);
   const stream = fs.createReadStream(filePath);
   stream.pipe(res);
-  stream.on("close", () => {
-    try { fs.unlinkSync(filePath); } catch {}
-  });
+  stream.on("close", () => { try { fs.unlinkSync(filePath); } catch {} });
 }
 
-app.listen(PORT, () => {
-  console.log(`🎵 YT Service running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🎵 YT Service running on port ${PORT}`));
